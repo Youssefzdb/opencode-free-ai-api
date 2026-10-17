@@ -1,6 +1,6 @@
 # 🤖 OpenCode Free AI API — دليل الربط الكامل
 
-> واجهة ذكاء اصطناعي **مجانية بالكامل** (بدون مفاتيح API) تعمل عبر Base44، تدعم 44 نموذجاً منها beam-free، مع **ذاكرة محادثات** و **System Prompt** و **فحص صحة النماذج**. تدعم CORS فيمكن استدعاؤها مباشرة من أي موقع ويب.
+> واجهة ذكاء اصطناعي **مجانية بالكامل** (بدون مفاتيح API) تعمل عبر Base44، تدعم 44 نموذجاً منها beam-free، مع **بث لحظي (Streaming)** يُظهر النموذج **وهو يفكر ويكتب في الوقت الحقيقي**، وذاكرة محادثات و System Prompt وفحص صحة النماذج. تدعم CORS فيمكن استدعاؤها مباشرة من أي موقع ويب.
 
 **Base URL:**
 ```
@@ -59,6 +59,7 @@ const r = await fetch(API, {
 - كل جلسة تخزن حتى **60 رسالة**، وتُرسل آخر **30** للنموذج في كل دور.
 - لعرض سجل الدردشة عند فتح صفحتك: `POST /opencodeSessions` مع `{"action":"get","session":"user-123"}`.
 - زر "محادثة جديدة" في موقعك = `{"action":"clear","session":"user-123"}`.
+- **وضعان للذاكرة:** الرد يحمل `memory_mode` — `"server"` (السيرفر حفظ الجلسة) أو `"skipped"` (تخزين السيرفر محجوب عن الزوار المجهولين في تطبيق خاص؛ عندها اعتمد الذاكرة المحلية: خزّن الرسائل في localStorage وأرسلها كـ `messages[]` كل دور — مثال `chat-widget.html` يفعل الاثنين معاً تلقائياً).
 
 ## 🎭 تخصيص الشخصية (System Prompt)
 
@@ -90,6 +91,53 @@ await fetch("https://superagent-2b61d5b9.base44.app/functions/opencodeSessions",
 ```
 
 `reasoning_effort` يُرسل فقط للنماذج الداعمة تلقائياً (لا يفشل الطلب أبداً).
+
+## 🔴 البث اللحظي (Streaming) + إظهار التفكير Real-time
+
+مرّر `"stream": true` ويصبح الرد **Server-Sent Events** تتدفق لحظياً — كل توكِن يصل فور كتابته، مع أحداث تفكير منفصلة:
+
+```js
+const res = await fetch(API, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ prompt: "اشرح لي نظرية النسبية", stream: true })
+});
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+let buffer = "";
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  buffer += decoder.decode(value, { stream: true });
+  const lines = buffer.split("\n");
+  buffer = lines.pop();
+  for (const line of lines) {
+    if (!line.startsWith("data:")) continue;
+    const evt = JSON.parse(line.slice(5));
+    if (evt.type === "reasoning") showThinking(evt.text); // 💭 النموذج يفكر الآن
+    if (evt.type === "answer")   appendAnswer(evt.text);  // ✍️ الرد يُكتب حرفياً
+    if (evt.type === "done")     finish(evt.usage);       // ✅ انتهى (usage + الجلسة)
+    if (evt.type === "error")    showError(evt.error);
+  }
+}
+```
+
+**الأحداث بالترتيب:**
+
+| الحدث | المعنى |
+|---|---|
+| `start` | بدأ الطلب (يحمل النموذج و `reasoning_effort` المطبّق) |
+| `reasoning` | جزء من سلسلة التفكير — اعرضه في صندوق "💭 يفكر الآن" |
+| `answer` | توكِن من الرد — ألحقه بالنص مباشرة أمام عين المستخدم |
+| `done` | انتهى البث — يحمل `content` الكامل + `usage` + معلومات الجلسة |
+| `error` | خطأ (نموذج معطل، فراغ، حد معدل) ثم يغلق البث |
+
+**نصائح واجهة المستخدم:**
+- قبل أول حدث: اعرض مؤشر "يستعد · · ·".
+- مع أول `reasoning`: افتح صندوق تفكير يتحدث لحظياً (آخر ~400 حرف تكفي).
+- مع أول `answer`: طوِ صندوق التفكير (سطر قابل للفتح) وابدأ كتابة الرد حرفياً مع مؤشر وميض.
+- الموديلات بلا تفكير سترسل `answer` مباشرة — الواجهة نفسها تعمل مع الحالتين.
 
 ## 🩺 فحص النماذج الحية الآن
 
