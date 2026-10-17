@@ -82,10 +82,26 @@ function addMsg(text, cls) {
   return el;
 }
 
+// ===== استكمال تلقائي: لو انقطع الرد في منتصفه (finish_reason=length أو بلا done) نكمل من نقطة التوقف =====
+async function askFull(prompt, continuationOf) {
+  let result = await ask(continuationOf ? null : prompt, null, continuationOf);
+  let guard = 0;
+  while (result && result.truncated && guard < 4) {
+    result = await ask(null, null, result);
+    guard++;
+  }
+  return result;
+}
+
 // ===== الدردشة المتدفقة عبر SSE =====
-async function ask(prompt, retryModel) {
+// prompt = طلب جديد | continuationOf = {answer, session} للاستكمال بعد الانقطاع
+async function ask(prompt, retryModel, continuationOf) {
   const history = loadHistory();
   const model = retryModel || document.getElementById("model").value;
+  const userMsg = continuationOf
+    ? { role: "user", content: "أكمل من حيث توقفت بالضبط. لا تكرر أي شيء، أكمل النص المقطوع مباشرة." }
+    : { role: "user", content: prompt };
+  // في وضع الاستكمال لا نعرض رسالة مستخدم جديدة — نكمل في نفس الفقاعة
 
   // مؤشر "يكتب" قبل أول توكِن
   const typing = document.createElement("div");
@@ -96,18 +112,25 @@ async function ask(prompt, retryModel) {
   // صندوق التفكير + فقاعة الرد (تُنشأ عند أول توكِن)
   let thinkBox = null, trace = null, bubble = null, answer = "";
   let reasoningText = "";
+  let gotDone = false;
 
   try {
     const res = await fetch(API, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        prompt,
         stream: true,                       // ← مفتاح البث اللحظي
         model,
         session: sessionKey,                // ذاكرة السيرفر إن كانت متاحة
-        messages: history.slice(-30).concat([{ role: "user", content: prompt }]), // ذاكرة محلية مضمونة
-        max_tokens: 2000,
+        messages: continuationOf
+          ? history.slice(-30).concat([
+              { role: "user", content: continuationOf.lastUserPrompt || prompt || "" },
+              { role: "assistant", content: continuationOf.answer },
+              userMsg,
+            ])
+          : history.slice(-30).concat([{ role: "user", content: prompt }]), // ذاكرة محلية مضمونة
+        // لا ترسل max_tokens هنا: الوضع الافتراضي "max power" يعطي النموذج سقفه الكامل
+        // (beam-free = 131072 توكِن). حد صغير مثل 2000 يقصّ ردود توليد الكود الطويلة!
       }),
     });
 
@@ -156,7 +179,12 @@ async function ask(prompt, retryModel) {
             thinkBox.innerHTML = ""; thinkBox.appendChild(s); thinkBox.appendChild(d);
             thinkBox = null;
           }
-          if (!bubble) { typing.remove(); bubble = addMsg("", "bot"); }
+          if (!bubble) {
+            typing.remove();
+            // في وضع الاستكمال نستمر في آخر فقاعة بدل فقاعة جديدة
+            bubble = continuationOf ? (log.querySelector(".msg.bot:last-of-type") || addMsg("", "bot")) : addMsg("", "bot");
+            if (continuationOf && bubble.textContent) answer = bubble.textContent; // لا تفقد النص السابق
+          }
           answer += evt.text;
           bubble.textContent = answer;                     // النص يُكتب حرفياً أمام العين
           bubble.innerHTML += '<span class="cursor">&nbsp;</span>';
@@ -164,17 +192,26 @@ async function ask(prompt, retryModel) {
           log.scrollTop = log.scrollHeight;
         }
         if (evt.type === "done") {
+          gotDone = true;
           if (bubble) bubble.textContent = answer || evt.content || "";
+          const finalText = answer || evt.content || "";
+          const truncated = evt.finish_reason === "length"; // قُصّ عند حد التوكنات
           // حفظ الذاكرة المحلية
           const h = loadHistory();
-          h.push({ role: "user", content: prompt }, { role: "assistant", content: answer || evt.content || "" });
+          if (!continuationOf) h.push({ role: "user", content: prompt }, { role: "assistant", content: finalText });
+          else {
+            // دمج الاستكمال مع الرد السابق
+            for (let i = h.length - 1; i >= 0; i--) if (h[i].role === "assistant") { h[i].content = finalText; break; }
+          }
           saveHistory(h);
-          // إن كان تخزين السيرفر متاحاً فذاكرة السيرفر حُفظت تلقائياً أيضاً (memory_mode)
+          return { answer: finalText, truncated, lastUserPrompt: prompt };
         }
         if (evt.type === "error") throw new Error(evt.error || "stream_error");
       }
     }
     if (!bubble && !answer) throw new Error("empty_stream");
+    // انتهى البث بدون done (انقطاع شبكة/منصة): لو وصل نص جزئي نستكمله
+    if (!gotDone && answer && bubble) return { answer, truncated: true, lastUserPrompt: prompt };
   } catch (e) {
     typing.remove();
     addMsg("⚠️ " + e.message, "err");
@@ -188,7 +225,7 @@ document.getElementById("form").addEventListener("submit", async (e) => {
   input.value = "";
   addMsg(prompt, "user");
   send.disabled = true;
-  await ask(prompt);
+  await askFull(prompt);
   send.disabled = false;
   input.focus();
 });
